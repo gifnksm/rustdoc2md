@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MISE_CARGO_BINSTALL_ONLY: true
+  MISE_LOCKED: true
+
+jobs:
+  set-matrix:
+    name: Set matrix values
+    outputs:
+      msrv: ${{ steps.set-values.outputs.msrv }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Set matrix values
+        id: set-values
+        run: |
+          msrv="$(./scripts/print-metadata msrv)"
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  check-rust:
+    name: Check (rust)
+    needs: set-matrix
+    strategy:
+      fail-fast: true
+      matrix:
+        rust:
+          - stable
+          - ${{ needs.set-matrix.outputs.msrv }}
+    uses: $/.github/workflows/reusable-check-rust.yml
+    with:
+      rust-toolchain: ${{ matrix.rust }}
+      run-doc-checks: ${{ matrix.rust == 'stable' }}
+
+  check-misc:
+    name: Check (misc)
+    uses: $/.github/workflows/reusable-check-misc.yml
+    with:
+      rust-toolchain: stable
+
+  lint-rust:
+    name: Lint (rust)
+    uses: $/.github/workflows/reusable-lint-rust.yml
+    with:
+      rust-toolchain: stable
+
+  lint-misc:
+    name: Lint (misc)
+    uses: $/.github/workflows/reusable-lint-misc.yml
+    with:
+      rust-toolchain: stable
+
+  test-rust:
+    name: Test (rust)
+    needs: set-matrix
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        rust:
+          - stable
+          - ${{ needs.set-matrix.outputs.msrv }}
+    uses: $/.github/workflows/reusable-test-rust.yml
+    with:
+      rust-toolchain: ${{ matrix.rust }}
+
+  coverage-rust:
+    name: Coverage (rust)
+    permissions:
+      contents: read
+      id-token: write # Required for codecov-action to upload coverage reports
+    uses: $/.github/workflows/reusable-coverage-rust.yml
+    with:
+      rust-toolchain: stable
+
+  audit:
+    name: Audit
+    uses: $/.github/workflows/reusable-audit.yml
+    with:
+      rust-toolchain: stable
+
+  ci-complete:
+    name: ci-complete
+    if: ${{ always() }}
+    needs:
+      - set-matrix
+      - check-rust
+      - check-misc
+      - lint-rust
+      - lint-misc
+      - test-rust
+      - coverage-rust
+      - audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: CI complete
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -e '
+            to_entries
+            | map(select(.key != "audit"))
+            | all(.value.result == "success")
+          ' <<< "$NEEDS"
+        shell: bash
